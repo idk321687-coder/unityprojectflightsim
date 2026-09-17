@@ -4,8 +4,12 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(Rigidbody))]
 public class SimpleFlightControls : MonoBehaviour
 {
-    [Header("Speed")]
+    [Header("Engine")]
     public float maxSpeed = 120f;
+    public float throttleChangeSpeed = 0.5f;
+
+    [Range(0f, 1f)]
+    public float throttle = 1f;
 
     [Header("Flight Controls")]
     public float pitchPower = 5f;
@@ -20,22 +24,31 @@ public class SimpleFlightControls : MonoBehaviour
     public float rollStability = 3f;
     public float yawStability = 1f;
 
+    [Header("Crash Physics")]
+    public float landingSpeedThreshold = 15f;
+    public float crashSpeedThreshold = 40f;
+
+    public float bounceStrength = 0.8f;
+    public float tumbleStrength = 80f;
+    public float crashRecoveryTime = 3f;
+
     private Rigidbody rb;
 
     private float pitchInput;
     private float rollInput;
     private float yawInput;
 
+    private bool recoveringFromCrash;
+    private float recoveryTimer;
+
     void Awake()
     {
         rb = GetComponent<Rigidbody>();
 
         rb.useGravity = true;
-
-        // Keep physics stable.
         rb.linearDamping = 0.1f;
         rb.angularDamping = 2f;
-        rb.maxAngularVelocity = 5f;
+        rb.maxAngularVelocity = 10f;
     }
 
     void Update()
@@ -45,6 +58,16 @@ public class SimpleFlightControls : MonoBehaviour
 
     void FixedUpdate()
     {
+        if (recoveringFromCrash)
+        {
+            recoveryTimer -= Time.fixedDeltaTime;
+
+            if (recoveryTimer <= 0f)
+            {
+                recoveringFromCrash = false;
+            }
+        }
+
         Fly();
         Stabilize();
     }
@@ -55,50 +78,56 @@ public class SimpleFlightControls : MonoBehaviour
         rollInput = 0f;
         yawInput = 0f;
 
-        // Keyboard
         if (Keyboard.current != null)
         {
-            // W = nose down
+            // Pitch
             if (Keyboard.current.wKey.isPressed ||
                 Keyboard.current.upArrowKey.isPressed)
             {
                 pitchInput = 1f;
             }
 
-            // S = nose up
             if (Keyboard.current.sKey.isPressed ||
                 Keyboard.current.downArrowKey.isPressed)
             {
                 pitchInput = -1f;
             }
 
-            // A = roll left
+            // Roll
             if (Keyboard.current.aKey.isPressed ||
                 Keyboard.current.leftArrowKey.isPressed)
             {
                 rollInput = -1f;
             }
 
-            // D = roll right
             if (Keyboard.current.dKey.isPressed ||
                 Keyboard.current.rightArrowKey.isPressed)
             {
                 rollInput = 1f;
             }
 
-            // Q/E = yaw
+            // Yaw
             if (Keyboard.current.qKey.isPressed)
-            {
                 yawInput = -1f;
-            }
 
             if (Keyboard.current.eKey.isPressed)
-            {
                 yawInput = 1f;
+
+            // Throttle Up
+            if (Keyboard.current.leftShiftKey.isPressed)
+            {
+                throttle += throttleChangeSpeed * Time.deltaTime;
+            }
+
+            // Throttle Down
+            if (Keyboard.current.leftCtrlKey.isPressed)
+            {
+                throttle -= throttleChangeSpeed * Time.deltaTime;
             }
         }
 
-        // Controller
+        throttle = Mathf.Clamp01(throttle);
+
         if (Gamepad.current != null)
         {
             Vector2 stick = Gamepad.current.leftStick.ReadValue();
@@ -113,13 +142,14 @@ public class SimpleFlightControls : MonoBehaviour
 
     void Fly()
     {
-        // Keep the plane moving slowly forward.
-        Vector3 forwardVelocity =
-            transform.forward * maxSpeed;
+        if (!recoveringFromCrash)
+        {
+            float currentSpeed = maxSpeed * throttle;
 
-        rb.linearVelocity = forwardVelocity;
+            rb.linearVelocity =
+                transform.forward * currentSpeed;
+        }
 
-        // Pitch
         rb.AddTorque(
             transform.right *
             -pitchInput *
@@ -127,7 +157,6 @@ public class SimpleFlightControls : MonoBehaviour
             ForceMode.Force
         );
 
-        // Roll
         rb.AddTorque(
             transform.forward *
             -rollInput *
@@ -135,7 +164,6 @@ public class SimpleFlightControls : MonoBehaviour
             ForceMode.Force
         );
 
-        // Yaw
         rb.AddTorque(
             transform.up *
             yawInput *
@@ -143,10 +171,8 @@ public class SimpleFlightControls : MonoBehaviour
             ForceMode.Force
         );
 
-        // Coordinated turn: banking should also turn the plane.
-        // bank = 1 when wings level, ~0 when banked 90 degrees.
         float bank = Vector3.Dot(transform.right, Vector3.up);
-        float turnFromBank = -bank; // flip sign if it turns the wrong way
+        float turnFromBank = -bank;
 
         rb.AddTorque(
             transform.up *
@@ -158,13 +184,14 @@ public class SimpleFlightControls : MonoBehaviour
 
     void Stabilize()
     {
-        // Convert angular velocity into local space.
+        if (recoveringFromCrash)
+            return;
+
         Vector3 localAngularVelocity =
             transform.InverseTransformDirection(
                 rb.angularVelocity
             );
 
-        // Stop excessive pitch rotation.
         rb.AddTorque(
             transform.right *
             -localAngularVelocity.x *
@@ -172,7 +199,6 @@ public class SimpleFlightControls : MonoBehaviour
             ForceMode.Force
         );
 
-        // Stop excessive rolling.
         rb.AddTorque(
             transform.forward *
             -localAngularVelocity.z *
@@ -180,12 +206,58 @@ public class SimpleFlightControls : MonoBehaviour
             ForceMode.Force
         );
 
-        // Stop excessive yawing.
         rb.AddTorque(
             transform.up *
             -localAngularVelocity.y *
             yawStability,
             ForceMode.Force
         );
+    }
+
+    void OnCollisionEnter(Collision collision)
+    {
+        if (collision.contactCount == 0)
+            return;
+
+        float impactSpeed =
+            collision.relativeVelocity.magnitude;
+
+        // Safe landing
+        if (impactSpeed < landingSpeedThreshold)
+            return;
+
+        ContactPoint contact =
+            collision.contacts[0];
+
+        Vector3 bounceVelocity =
+            Vector3.Reflect(
+                rb.linearVelocity,
+                contact.normal
+            );
+
+        // Medium impact
+        if (impactSpeed < crashSpeedThreshold)
+        {
+            rb.linearVelocity =
+                bounceVelocity * bounceStrength;
+
+            recoveringFromCrash = true;
+            recoveryTimer = 1.5f;
+
+            return;
+        }
+
+        // Hard crash
+        rb.linearVelocity =
+            bounceVelocity * bounceStrength;
+
+        rb.AddTorque(
+            Random.onUnitSphere *
+            tumbleStrength,
+            ForceMode.Impulse
+        );
+
+        recoveringFromCrash = true;
+        recoveryTimer = crashRecoveryTime;
     }
 }
